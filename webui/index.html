@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MacroPad 設定</title>
+<style>
+  :root { --bg:#1e1e2e; --card:#2a2a3c; --fg:#e0e0e8; --acc:#7aa2f7; --ok:#9ece6a; --err:#f7768e; }
+  * { box-sizing:border-box; }
+  body { font-family:"Segoe UI",system-ui,sans-serif; background:var(--bg); color:var(--fg); margin:0; padding:16px; max-width:720px; margin-inline:auto; }
+  h1 { font-size:1.3em; }
+  .card { background:var(--card); border-radius:10px; padding:14px; margin-bottom:12px; }
+  textarea { width:100%; min-height:52px; background:#16161e; color:var(--fg); border:1px solid #444; border-radius:6px; padding:8px; font-family:Consolas,monospace; font-size:0.95em; resize:vertical; }
+  button { background:var(--acc); color:#16161e; border:0; border-radius:6px; padding:8px 16px; font-weight:600; cursor:pointer; margin:4px 4px 4px 0; }
+  button.secondary { background:#565f89; color:var(--fg); }
+  select { background:#16161e; color:var(--fg); border:1px solid #444; border-radius:6px; padding:6px; max-width:100%; }
+  #log { background:#16161e; border-radius:6px; padding:8px; font-family:Consolas,monospace; font-size:0.85em; white-space:pre-wrap; max-height:180px; overflow-y:auto; }
+  .stat-ok { color:var(--ok); } .stat-err { color:var(--err); }
+  .hint { font-size:0.8em; color:#9a9ab0; }
+  h2 { font-size:1em; margin:0 0 6px; }
+</style>
+</head>
+<body>
+<h1>⌨️ MacroPad 設定</h1>
+
+<div class="card" id="serialCard">
+  <button id="connectBtn">シリアル接続</button>
+  <span id="stat">未接続</span>
+  <div class="hint">Chrome / Edge でこのファイルを開き、接続後にキーを設定します。接続するとデバイスはconfigモード(LED一斉点滅)になります。</div>
+</div>
+
+<div class="card" id="apCard" style="display:none">
+  <span class="stat-ok">WiFi AP経由で接続中</span>
+  <div class="hint">設定を保存したら「configモード終了」を押してください(WiFi APは停止します)。</div>
+</div>
+
+<div id="keys"></div>
+
+<div class="card">
+  <button id="loadBtn">読み込み</button>
+  <button id="saveBtn">保存</button>
+  <button id="exitBtn" class="secondary">configモード終了</button>
+</div>
+
+<div class="card">
+  <h2>マクロ書式</h2>
+  <div class="hint">
+    そのまま書いた文字はタイプされます(英数字と記号のみ。日本語の直接入力は不可)。<br>
+    <b>{ENTER} {TAB} {ESC} {F1}〜{F12} {UP} {DOWN}</b> … 特殊キー /
+    <b>{CTRL+C} {WIN+R} {CMD+SPACE}</b> … 同時押し /
+    <b>{WAIT:500}</b> … 500ms待機<br>
+    IME: <b>{ZENHAN}</b>(Win 半角/全角) <b>{EISU}</b> <b>{KANA}</b>(Mac 英数/かな) <b>{CTRL+SPACE}</b>(Android)<br>
+    メディア: <b>{BROWSER}</b>(ブラウザ起動) <b>{VOL_UP} {VOL_DOWN} {MUTE} {MEDIA_PLAY}</b>
+  </div>
+</div>
+
+<pre id="log"></pre>
+
+<script>
+const PRESETS = [
+  ["-- プリセットを挿入 --", ""],
+  ["[Win] IME切り替え(半角/全角)", "{ZENHAN}"],
+  ["[Win] ファイル名を指定して実行→メモ帳", "{WIN+R}{WAIT:400}notepad{ENTER}"],
+  ["[Win] URLを開く", "{WIN+R}{WAIT:400}https://example.com{ENTER}"],
+  ["[Win] ファイルを開く", "{WIN+R}{WAIT:400}C:\\path\\to\\file.txt{ENTER}"],
+  ["[Mac] 英数(IME OFF)", "{EISU}"],
+  ["[Mac] かな(IME ON)", "{KANA}"],
+  ["[Mac] Spotlight検索", "{CMD+SPACE}"],
+  ["[Android] IME切り替え", "{CTRL+SPACE}"],
+  ["[共通] ブラウザ起動", "{BROWSER}"],
+  ["[共通] 音量アップ", "{VOL_UP}"],
+  ["[共通] コピー", "{CTRL+C}"],
+  ["[共通] 貼り付け", "{CTRL+V}"],
+];
+const NKEYS = 3;
+const isAP = location.protocol.startsWith("http");
+const $ = (id) => document.getElementById(id);
+const log = (m, cls) => { const el = $("log"); el.innerHTML += (cls ? `<span class="${cls}">${m}</span>` : m) + "\n"; el.scrollTop = el.scrollHeight; };
+
+// build key editors
+const keysDiv = $("keys");
+const POS = ["上", "中", "下"];
+for (let i = 1; i <= NKEYS; i++) {
+  const d = document.createElement("div");
+  d.className = "card";
+  d.innerHTML = `<h2>キー${i}(${POS[i-1]})</h2>
+    <textarea id="k${i}" placeholder="例: hello{ENTER}"></textarea>
+    <select id="p${i}"></select> <button class="secondary" id="ins${i}">挿入</button>`;
+  keysDiv.appendChild(d);
+  const sel = d.querySelector(`#p${i}`);
+  PRESETS.forEach(([label, v]) => { const o = document.createElement("option"); o.textContent = label; o.value = v; sel.appendChild(o); });
+  d.querySelector(`#ins${i}`).onclick = () => { if (sel.value) $(`k${i}`).value += sel.value; };
+}
+
+if (isAP) { $("serialCard").style.display = "none"; $("apCard").style.display = "block"; }
+
+// ---- serial (WebSerial) backend ----
+let port = null, writer = null, rxBuf = "";
+async function serialConnect() {
+  if (!navigator.serial) { log("このブラウザはWeb Serial非対応です(Chrome/Edgeを使用してください)", "stat-err"); return; }
+  port = await navigator.serial.requestPort();
+  await port.open({ baudRate: 115200 });
+  writer = port.writable.getWriter();
+  (async () => {
+    const dec = new TextDecoder();
+    const reader = port.readable.getReader();
+    try { while (true) { const { value, done } = await reader.read(); if (done) break; rxBuf += dec.decode(value); log(dec.decode(value).trimEnd()); } } catch (e) {}
+  })();
+  $("stat").textContent = "接続済み"; $("stat").className = "stat-ok";
+  await sendLine("config");
+}
+async function sendLine(s) { rxBuf = ""; await writer.write(new TextEncoder().encode(s + "\n")); await new Promise(r => setTimeout(r, 400)); }
+
+// ---- shared ops ----
+async function doLoad() {
+  if (isAP) {
+    const j = await (await fetch("/api/keys")).json();
+    for (let i = 1; i <= NKEYS; i++) $(`k${i}`).value = j[i] || "";
+    log("読み込み完了", "stat-ok");
+  } else {
+    if (!writer) { log("先にシリアル接続してください", "stat-err"); return; }
+    await sendLine("show");
+    for (const line of rxBuf.split("\n")) {
+      const m = line.match(/^key([1-3]) = (.*)$/);
+      if (m) $(`k${m[1]}`).value = m[2].replace(/\r$/, "");
+    }
+    log("読み込み完了", "stat-ok");
+  }
+}
+async function doSave() {
+  for (let i = 1; i <= NKEYS; i++) {
+    const v = $(`k${i}`).value.replace(/[\r\n]/g, "");
+    if (!v) continue;
+    if (isAP) {
+      const r = await fetch("/api/set", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: `k=${i}&v=${encodeURIComponent(v)}` });
+      log(`キー${i}: ${(await r.text()).trim()}`);
+    } else {
+      if (!writer) { log("先にシリアル接続してください", "stat-err"); return; }
+      await sendLine(`${i}=${v}`);
+    }
+  }
+  log("保存処理完了(上のログでOK:を確認)", "stat-ok");
+}
+async function doExit() {
+  if (isAP) { await fetch("/api/exit", { method: "POST" }); log("configモードを終了しました(WiFi APは停止)", "stat-ok"); }
+  else if (writer) { await sendLine("exit"); }
+}
+
+$("connectBtn").onclick = () => serialConnect().catch(e => log("接続エラー: " + e.message, "stat-err"));
+$("loadBtn").onclick = () => doLoad().catch(e => log("エラー: " + e.message, "stat-err"));
+$("saveBtn").onclick = () => doSave().catch(e => log("エラー: " + e.message, "stat-err"));
+$("exitBtn").onclick = () => doExit().catch(e => log("エラー: " + e.message, "stat-err"));
+</script>
+</body>
+</html>

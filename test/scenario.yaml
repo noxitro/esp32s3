@@ -1,0 +1,88 @@
+name: "3-key macro pad: buttons, config mode, NVS persistence"
+version: 1
+author: "arlen"
+
+steps:
+  - wait-serial: "READY"
+
+  # --- Normal mode: each button sends its default string ---
+  - set-control:
+      part-id: btn1
+      control: pressed
+      value: 1
+  - wait-serial: "SENT[1]: KEY1"
+  - set-control:
+      part-id: btn1
+      control: pressed
+      value: 0
+  - delay: 100ms
+
+  - set-control:
+      part-id: btn2
+      control: pressed
+      value: 1
+  - wait-serial: "SENT[2]: KEY2"
+  - set-control:
+      part-id: btn2
+      control: pressed
+      value: 0
+  - delay: 100ms
+
+  - set-control:
+      part-id: btn3
+      control: pressed
+      value: 1
+  - wait-serial: "SENT[3]: KEY3"
+  - set-control:
+      part-id: btn3
+      control: pressed
+      value: 0
+  - delay: 100ms
+
+  # --- Hold all 3 buttons >= 3 s -> config mode ---
+  - set-control:
+      part-id: btn1
+      control: pressed
+      value: 1
+  - set-control:
+      part-id: btn2
+      control: pressed
+      value: 1
+  - set-control:
+      part-id: btn3
+      control: pressed
+      value: 1
+  - wait-serial: "CONFIG MODE"
+  - set-control:
+      part-id: btn1
+      control: pressed
+      value: 0
+  - set-control:
+      part-id: btn2
+      control: pressed
+      value: 0
+  - set-control:
+      part-id: btn3
+      control: pressed
+      value: 0
+  - delay: 200ms
+
+  # --- Set key2 string over serial, then exit ---
+  - write-serial: "2=hello\n"
+  - wait-serial: "OK: key2 = hello"
+  - write-serial: "show\n"
+  - wait-serial: "key2 = hello"
+  - write-serial: "exit\n"
+  - wait-serial: "NORMAL MODE"
+  - delay: 100ms
+
+  # --- New string is active (and persisted to NVS) ---
+  - set-control:
+      part-id: btn2
+      control: pressed
+      value: 1
+  - wait-serial: "SENT[2]: hello"
+  - set-control:
+      part-id: btn2
+      control: pressed
+      value: 0
