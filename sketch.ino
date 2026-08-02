@@ -58,6 +58,7 @@ const char *CONFIG_URL = "https://noxitro.github.io/esp32s3/webui/";
 Preferences prefs;
 WebServer server(80);
 String keyStrings[NUM_KEYS];
+bool layoutJIS = true;  // host keyboard layout: JIS (true) or US (false); NVS "layout"
 
 enum Mode { NORMAL, CONFIG };
 Mode mode = NORMAL;
@@ -84,7 +85,15 @@ void loadStrings() {
   keyStrings[0] = prefs.getString("s1", "KEY1");
   keyStrings[1] = prefs.getString("s2", "KEY2");
   keyStrings[2] = prefs.getString("s3", "KEY3");
+  layoutJIS = prefs.getString("layout", "jis") == "jis";
   prefs.end();
+}
+
+void saveLayout(bool jis) {
+  prefs.begin("keycfg", false);
+  prefs.putString("layout", jis ? "jis" : "us");
+  prefs.end();
+  layoutJIS = jis;
 }
 
 void saveString(int idx, const String &value) {
@@ -186,6 +195,32 @@ bool execToken(String tok) {
   if (pressedAny) Keyboard.releaseAll();
   return false;
 }
+// The US-layout ASCII map built into USBHIDKeyboard sends wrong keys for many
+// symbols when the HOST uses a JIS (Japanese) layout — e.g. ':' arrives as '+'.
+// This table sends the correct JIS keystrokes for the characters that differ.
+struct JisChar { char c; uint8_t usage; bool shift; };
+const JisChar JIS_CHARS[] = {
+  {'"', 0x1F, true},  {'&', 0x23, true},  {'\'', 0x24, true}, {'(', 0x25, true},
+  {')', 0x26, true},  {'*', 0x34, true},  {'+', 0x33, true},  {':', 0x34, false},
+  {'=', 0x2D, true},  {'@', 0x2F, false}, {'[', 0x30, false}, {'\\', 0x87, false},
+  {']', 0x32, false}, {'^', 0x2E, false}, {'_', 0x87, true},  {'`', 0x2F, true},
+  {'{', 0x30, true},  {'|', 0x89, true},  {'}', 0x32, true},  {'~', 0x2E, true},
+};
+
+void typeChar(char c) {
+  if (layoutJIS) {
+    for (auto &j : JIS_CHARS) {
+      if (j.c == c) {
+        if (j.shift) Keyboard.press(KEY_LEFT_SHIFT);
+        Keyboard.pressRaw(j.usage);
+        delay(8);
+        Keyboard.releaseAll();
+        return;
+      }
+    }
+  }
+  Keyboard.write(c);
+}
 #endif  // HAS_USB_HID
 
 void execMacro(const String &m) {
@@ -199,7 +234,7 @@ void execMacro(const String &m) {
       if (!execToken(tok)) Serial.printf("MACRO ERR: unknown token {%s}\n", tok.c_str());
       i = close;
     } else if ((uint8_t)c >= 0x20 && (uint8_t)c < 0x7F) {
-      Keyboard.write(c);
+      typeChar(c);
       delay(8);
     }
     // non-ASCII bytes are skipped: HID cannot type them directly
@@ -274,6 +309,7 @@ void printStrings() {
   for (int i = 0; i < NUM_KEYS; i++) {
     Serial.printf("key%d = %s\n", i + 1, keyStrings[i].c_str());
   }
+  Serial.printf("layout = %s\n", layoutJIS ? "jis" : "us");
 }
 
 void setAllLeds(bool on) {
@@ -307,6 +343,11 @@ void handleConfigCommand(String line) {
 
   if (line == "exit") { exitConfigMode(); return; }
   if (line == "show") { printStrings(); return; }
+  if (line == "layout=jis" || line == "layout=us") {
+    saveLayout(line.endsWith("jis"));
+    Serial.printf("OK: layout = %s\n", layoutJIS ? "jis" : "us");
+    return;
+  }
   if (line.startsWith("test") && line.length() == 5 && line[4] >= '1' && line[4] <= '3') {
     int idx = line[4] - '1';
     Serial.printf("TEST key%d...\n", idx + 1);
