@@ -85,7 +85,10 @@ function makeFakeFetch(state) {
 }
 
 async function loadUI({ forceAP, state }) {
-  const html = await (await fetch("../index.html?t=" + Date.now(), { cache: "no-store" })).text();
+  // ?target=<url> runs the suite against a deployed copy instead of the local file
+  const target = new URLSearchParams(location.search).get("target") || "../index.html";
+  const sep = target.includes("?") ? "&" : "?";
+  const html = await (await fetch(target + sep + "t=" + Date.now(), { cache: "no-store" })).text();
   const stub = `<script>
     window.__forceAP = ${forceAP === undefined ? "undefined" : forceAP};
     window.__state = parent.__stateFor(${JSON.stringify(state.id)});
