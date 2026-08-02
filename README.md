@@ -25,8 +25,10 @@
 
 configモードに入る: **3キー同時3秒長押し** または シリアルで `config` 送信。configモード中はLEDが一斉点滅し、**WiFiアクセスポイントが起動**します。
 
-1. **Web UI(WiFi)**: スマホ/PCをWiFi `MacroPad-Config`(パスワード `macropad123`)に接続し、ブラウザで `http://192.168.4.1/` を開く
-2. **Web UI(WebSerial)**: [webui/index.html](webui/index.html) をChrome/Edgeで開き「シリアル接続」(configモードに自動で入ります)
+1. **Web UI(WebSerial・推奨)**: https://noxitro.github.io/esp32s3/webui/ をChrome/Edgeで開き「シリアル接続」(configモードに自動で入ります)。ローカルの [webui/index.html](webui/index.html) でも同じ
+   - **configモード中にキー1を押すと、デバイスが自動でこのページをブラウザで開きます**(Windows: Win+R経由)。HTMLファイルを持ち歩く必要はありません
+   - ChromeはデバイスをUSB接続した際に「設定ページを開く」通知も表示します(WebUSBランディングページ)
+2. **Web UI(WiFi)**: スマホをWiFi `MacroPad-Config`(パスワード `macropad123`)に接続し、ブラウザで `http://192.168.4.1/` を開く(PCのWiFiからの接続は非推奨 — 環境によりネットワークドライバの不具合を誘発することがあります)
 3. **シリアルモニタ**(115200 baud):
 
 | コマンド | 動作 |

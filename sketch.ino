@@ -50,6 +50,10 @@ const size_t MACRO_MAX_LEN = 500;
 
 const char *AP_SSID = "MacroPad-Config";
 const char *AP_PASS = "macropad123";
+// Public config UI (GitHub Pages). Pressing key 1 while in config mode types a
+// Win+R macro that opens this URL; it is also advertised as the WebUSB landing
+// page (Chrome shows a "Go to ..." notification when the device is plugged in).
+const char *CONFIG_URL = "https://noxitro.github.io/esp32s3/webui/";
 
 Preferences prefs;
 WebServer server(80);
@@ -284,6 +288,7 @@ void enterConfigMode() {
   setAllLeds(false);
   Serial.println("CONFIG MODE");
   Serial.println("Commands: 1=<macro>  2=<macro>  3=<macro>  show  test1|test2|test3  exit");
+  Serial.printf("Press key 1 to open the config page: %s\n", CONFIG_URL);
   startConfigServer();
 }
 
@@ -399,6 +404,8 @@ void setup() {
   loadStrings();
 
 #if HAS_USB_HID
+  USB.webUSB(true);
+  USB.webUSBURL(CONFIG_URL);
   Keyboard.begin();
   Consumer.begin();
   USB.begin();
@@ -428,6 +435,11 @@ void loop() {
   } else {
     server.handleClient();
     if (exitRequested) { exitConfigMode(); return; }
+    // key 1 in config mode: open the web config page on the host (Windows)
+    if (pressEdge[0]) {
+      Serial.println("Opening config page on host...");
+      execMacro(String("{WIN+R}{WAIT:400}") + CONFIG_URL + "{ENTER}");
+    }
     unsigned long now = millis();
     if (now - lastBlinkMs >= CONFIG_BLINK_MS) {
       lastBlinkMs = now;
