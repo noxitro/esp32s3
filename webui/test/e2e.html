@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>MacroPad Web UI — e2e tests</title>
+<style>
+  body { font-family:Consolas,monospace; background:#1e1e2e; color:#e0e0e8; padding:16px; }
+  .pass { color:#9ece6a; } .fail { color:#f7768e; } .name { color:#7aa2f7; }
+  #summary { font-size:1.2em; margin:12px 0; }
+  iframe { display:none; }
+</style>
+</head>
+<body>
+<h1>Web UI e2e tests</h1>
+<div id="summary">running…</div>
+<pre id="out"></pre>
+<script>
+// Loads ../index.html into a srcdoc iframe with navigator.serial / fetch stubs
+// installed before the page script runs, then drives the real UI and asserts.
+
+const out = document.getElementById("out");
+let passed = 0, failed = 0;
+const log = (msg, cls) => { out.innerHTML += `<span class="${cls || ''}">${msg}</span>\n`; };
+const check = (name, cond, detail) => {
+  if (cond) { passed++; log(`  PASS  ${name}`, "pass"); }
+  else { failed++; log(`  FAIL  ${name}${detail ? " — " + detail : ""}`, "fail"); }
+};
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// --- fake device emulating the firmware's serial protocol ---
+function makeFakeSerial(state, win) {
+  // streams must be constructed in the iframe realm so the page's stream ops
+  // (getWriter / getReader) see same-realm objects
+  const W = win || window;
+  let rxController;
+  const encoder = new W.TextEncoder();
+  const emit = (s) => rxController.enqueue(encoder.encode(s));
+  const handleLine = (line) => {
+    state.sent.push(line);
+    if (line === "config") { state.mode = "CONFIG"; emit("CONFIG MODE\r\n"); return; }
+    if (line === "exit") { state.mode = "NORMAL"; emit("NORMAL MODE\r\n"); return; }
+    if (line === "show") {
+      for (let i = 1; i <= 3; i++) emit(`key${i} = ${state.keys[i]}\n`);
+      emit(`layout = jis\n`);
+      return;
+    }
+    const m = line.match(/^([1-3])=(.*)$/);
+    if (m && state.mode === "CONFIG") { state.keys[m[1]] = m[2]; emit(`OK: key${m[1]} = ${m[2]}\n`); return; }
+    emit(`ERR: unknown command: ${line}\n`);
+  };
+  const port = {
+    open: async () => {},
+    readable: new W.ReadableStream({ start(c) { rxController = c; } }),
+    writable: new W.WritableStream({
+      write(chunk) {
+        state.raw += new W.TextDecoder().decode(chunk);
+        let idx;
+        while ((idx = state.raw.indexOf("\n")) >= 0) {
+          const line = state.raw.slice(0, idx).replace(/\r$/, "");
+          state.raw = state.raw.slice(idx + 1);
+          if (line.length) handleLine(line);
+        }
+      },
+    }),
+  };
+  return { requestPort: async () => port };
+}
+
+function makeFakeFetch(state) {
+  return async (url, opts) => {
+    const u = String(url);
+    state.httpCalls.push({ url: u, body: opts && opts.body });
+    if (u.endsWith("/api/keys")) {
+      return { ok: true, status: 200, json: async () => ({ 1: state.keys[1], 2: state.keys[2], 3: state.keys[3] }) };
+    }
+    if (u.endsWith("/api/set")) {
+      const p = new URLSearchParams(opts.body);
+      state.keys[p.get("k")] = p.get("v");
+      return { ok: true, status: 200, text: async () => "OK" };
+    }
+    if (u.endsWith("/api/exit")) return { ok: true, status: 200, text: async () => "OK" };
+    // anything else (e.g. GitHub Pages 404 page) returns HTML — the old bug
+    return { ok: false, status: 404, text: async () => "<!DOCTYPE html>", json: async () => { throw new SyntaxError("Unexpected token '<'"); } };
+  };
+}
+
+async function loadUI({ forceAP, state }) {
+  const html = await (await fetch("../index.html?t=" + Date.now(), { cache: "no-store" })).text();
+  const stub = `<script>
+    window.__forceAP = ${forceAP === undefined ? "undefined" : forceAP};
+    window.__state = parent.__stateFor(${JSON.stringify(state.id)});
+    if (window.__state.useSerial) {
+      Object.defineProperty(navigator, "serial", {
+        value: parent.__makeFakeSerial(window.__state, window), configurable: true, writable: true,
+      });
+    }
+    window.fetch = parent.__makeFakeFetch(window.__state);
+    window.addEventListener("error", (e) => parent.__frameError(e.message));
+    window.addEventListener("unhandledrejection", (e) => parent.__frameError(String(e.reason)));
+  <\/script>`;
+  const withStub = html.replace("<body>", "<body>" + stub);
+  // Load through a real same-origin URL (not srcdoc) so the page sees
+  // location.protocol "http:" and a normal hostname — the same conditions as
+  // GitHub Pages, which is what the AP-misdetection bug depended on.
+  const frame = document.createElement("iframe");
+  frame.src = "blank.html";
+  document.body.appendChild(frame);
+  await new Promise(r => frame.onload = r);
+  const doc = frame.contentDocument;
+  doc.open();
+  doc.write(withStub);
+  doc.close();
+  await sleep(250);
+  return frame.contentWindow;
+}
+
+// state registry so the iframe can reach the same objects
+const states = {};
+const frameErrors = [];
+window.__frameError = (m) => { frameErrors.push(m); log(`  [page error] ${m}`, "fail"); };
+window.__stateFor = (id) => states[id];
+window.__makeFakeSerial = makeFakeSerial;
+window.__makeFakeFetch = makeFakeFetch;
+
+function newState(id, useSerial) {
+  const s = { id, useSerial, mode: "NORMAL", keys: { 1: "KEY1", 2: "KEY2", 3: "{ZENHAN}" }, sent: [], raw: "", httpCalls: [] };
+  states[id] = s;
+  return s;
+}
+
+// ---------------- tests ----------------
+
+async function testSerialMode() {
+  log("\nWebSerial モード (GitHub Pages / ローカルファイルから開いた場合)", "name");
+  const st = newState("serial", true);
+  const w = await loadUI({ forceAP: undefined, state: st });
+  const d = w.document;
+
+  check("APモードと誤判定しない (回帰: GitHub Pagesで /api/keys を叩かない)",
+        d.getElementById("apCard").style.display !== "block" && d.getElementById("serialCard").style.display !== "none");
+
+  d.getElementById("connectBtn").click();
+  await sleep(700);
+  check("接続すると config を送信して configモードに入る",
+        st.sent.includes("config") && st.mode === "CONFIG", `sent=${JSON.stringify(st.sent)}`);
+  check("接続状態が画面に反映される", d.getElementById("stat").textContent.includes("接続済み"));
+
+  d.getElementById("loadBtn").click();
+  await sleep(900);
+  check("読み込みでデバイスの現在値がフォームに入る",
+        d.getElementById("k1").value === "KEY1" && d.getElementById("k3").value === "{ZENHAN}",
+        `k1=${d.getElementById("k1").value} k3=${d.getElementById("k3").value}`);
+  check("読み込みでHTTP APIを呼ばない", st.httpCalls.length === 0, JSON.stringify(st.httpCalls));
+
+  d.getElementById("k2").value = "{WIN+R}{WAIT:400}notepad{ENTER}";
+  d.getElementById("saveBtn").click();
+  await sleep(1800);
+  check("保存でマクロがデバイスに書き込まれる",
+        st.keys[2] === "{WIN+R}{WAIT:400}notepad{ENTER}", `key2=${st.keys[2]}`);
+  check("記号を含むマクロが欠けずに送られる",
+        st.sent.some(l => l === "2={WIN+R}{WAIT:400}notepad{ENTER}"), JSON.stringify(st.sent));
+
+  d.getElementById("exitBtn").click();
+  await sleep(700);
+  check("終了で通常モードに戻る", st.sent.includes("exit") && st.mode === "NORMAL");
+}
+
+async function testApMode() {
+  log("\nWiFi APモード (デバイスの 192.168.4.1 から開いた場合)", "name");
+  const st = newState("ap", false);
+  const w = await loadUI({ forceAP: true, state: st });
+  const d = w.document;
+
+  check("APモードのUIが表示される", d.getElementById("apCard").style.display === "block");
+
+  d.getElementById("loadBtn").click();
+  await sleep(500);
+  check("読み込みで /api/keys の値がフォームに入る",
+        d.getElementById("k3").value === "{ZENHAN}", `k3=${d.getElementById("k3").value}`);
+
+  d.getElementById("k1").value = "hello{ENTER}";
+  d.getElementById("saveBtn").click();
+  await sleep(900);
+  check("保存で /api/set が呼ばれ値が反映される", st.keys[1] === "hello{ENTER}", `key1=${st.keys[1]}`);
+
+  d.getElementById("exitBtn").click();
+  await sleep(400);
+  check("終了で /api/exit が呼ばれる", st.httpCalls.some(c => c.url.endsWith("/api/exit")));
+}
+
+async function testErrorHandling() {
+  log("\nエラー処理", "name");
+  const st = newState("err", true);
+  const w = await loadUI({ forceAP: undefined, state: st });
+  const d = w.document;
+  d.getElementById("loadBtn").click();   // not connected yet
+  await sleep(300);
+  check("未接続で読み込むと案内が出る(例外で固まらない)",
+        d.getElementById("log").textContent.includes("シリアル接続"));
+}
+
+(async () => {
+  try {
+    await testSerialMode();
+    await testApMode();
+    await testErrorHandling();
+  } catch (e) {
+    failed++;
+    log("\nHARNESS ERROR: " + e.message, "fail");
+  }
+  const el = document.getElementById("summary");
+  el.textContent = `${passed} passed, ${failed} failed`;
+  el.className = failed ? "fail" : "pass";
+  window.__testResult = { passed, failed, done: true };
+})();
+</script>
+</body>
+</html>

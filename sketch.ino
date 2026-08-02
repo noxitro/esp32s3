@@ -25,6 +25,8 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <soc/rtc_cntl_reg.h>
+#include <esp_rom_sys.h>
 #include "webui_html.h"  // CONFIG_HTML[] generated from webui/index.html
 
 #if ARDUINO_USB_MODE == 0
@@ -350,6 +352,19 @@ void handleConfigCommand(String line) {
   if (line == "exit") { exitConfigMode(); return; }
   if (line == "show") { printStrings(); return; }
   if (line == "open") { openConfigPage(); return; }
+  if (line == "config") {  // idempotent: clients send this on every connect
+    Serial.println("CONFIG MODE");
+    Serial.printf("Already in config mode. http://%s/\n", WiFi.softAPIP().toString().c_str());
+    return;
+  }
+  if (line == "boot") {   // reboot into the ROM download mode for flashing
+    Serial.println("Rebooting into download mode...");
+    Serial.flush();
+    delay(200);
+    REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+    esp_rom_software_reset_system();  // keeps the RTC flag; esp_restart() clears it
+    return;
+  }
   if (line == "layout=jis" || line == "layout=us") {
     saveLayout(line.endsWith("jis"));
     Serial.printf("OK: layout = %s\n", layoutJIS ? "jis" : "us");
@@ -452,6 +467,10 @@ void setup() {
   loadStrings();
 
 #if HAS_USB_HID
+  // Opening/closing the CDC port (Arduino IDE, WebSerial, esptool) otherwise
+  // toggles DTR/RTS and drops the device off USB. Reflashing uses the "boot"
+  // serial command (or the BOOT button) instead.
+  Serial.enableReboot(false);
   USB.webUSB(true);
   USB.webUSBURL(CONFIG_URL);
   Keyboard.begin();

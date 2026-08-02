@@ -73,7 +73,10 @@ const PRESETS = [
   ["[共通] 貼り付け", "{CTRL+V}"],
 ];
 const NKEYS = 3;
-const isAP = location.protocol.startsWith("http");
+// AP mode only when this page is actually served BY the device (its softAP IP).
+// Served from GitHub Pages / opened as a file => WebSerial mode.
+// window.__forceAP lets the e2e harness exercise both paths.
+const isAP = (typeof window.__forceAP === "boolean") ? window.__forceAP : location.hostname === "192.168.4.1";
 const $ = (id) => document.getElementById(id);
 const log = (m, cls) => { const el = $("log"); el.innerHTML += (cls ? `<span class="${cls}">${m}</span>` : m) + "\n"; el.scrollTop = el.scrollHeight; };
 
@@ -114,7 +117,9 @@ async function sendLine(s) { rxBuf = ""; await writer.write(new TextEncoder().en
 // ---- shared ops ----
 async function doLoad() {
   if (isAP) {
-    const j = await (await fetch("/api/keys")).json();
+    const res = await fetch("/api/keys");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const j = await res.json();
     for (let i = 1; i <= NKEYS; i++) $(`k${i}`).value = j[i] || "";
     log("読み込み完了", "stat-ok");
   } else {
