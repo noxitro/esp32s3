@@ -20,7 +20,12 @@
 
 const out = document.getElementById("out");
 let passed = 0, failed = 0;
-const log = (msg, cls) => { out.innerHTML += `<span class="${cls || ''}">${msg}</span>\n`; };
+const log = (msg, cls) => {
+  const s = document.createElement("span");
+  if (cls) s.className = cls;
+  s.textContent = msg + "\n";
+  out.appendChild(s);
+};
 const check = (name, cond, detail) => {
   if (cond) { passed++; log(`  PASS  ${name}`, "pass"); }
   else { failed++; log(`  FAIL  ${name}${detail ? " — " + detail : ""}`, "fail"); }
@@ -40,10 +45,16 @@ function makeFakeSerial(state, win) {
     if (line === "config") { state.mode = "CONFIG"; emit("CONFIG MODE\r\n"); return; }
     if (line === "exit") { state.mode = "NORMAL"; emit("NORMAL MODE\r\n"); return; }
     if (line === "show") {
-      for (let i = 1; i <= 3; i++) emit(`key${i} = ${state.keys[i]}\n`);
-      emit(`layout = jis\n`);
+      const send = () => {
+        for (let i = 1; i <= 3; i++) emit(`key${i} = ${state.keys[i]}\n`);
+        emit(`layout = ${state.layout}\n`);
+      };
+      // optionally emulate a device that stalls longer than any fixed sleep
+      if (state.slowMs) setTimeout(send, state.slowMs); else send();
       return;
     }
+    const lay = line.match(/^layout=(jis|us)$/);
+    if (lay && state.mode === "CONFIG") { state.layout = lay[1]; emit(`OK: layout = ${lay[1]}\n`); return; }
     const m = line.match(/^([1-3])=(.*)$/);
     if (m && state.mode === "CONFIG") { state.keys[m[1]] = m[2]; emit(`OK: key${m[1]} = ${m[2]}\n`); return; }
     emit(`ERR: unknown command: ${line}\n`);
@@ -71,11 +82,15 @@ function makeFakeFetch(state) {
     const u = String(url);
     state.httpCalls.push({ url: u, body: opts && opts.body });
     if (u.endsWith("/api/keys")) {
-      return { ok: true, status: 200, json: async () => ({ 1: state.keys[1], 2: state.keys[2], 3: state.keys[3] }) };
+      return { ok: true, status: 200, json: async () => ({ 1: state.keys[1], 2: state.keys[2], 3: state.keys[3], layout: state.layout }) };
     }
     if (u.endsWith("/api/set")) {
       const p = new URLSearchParams(opts.body);
       state.keys[p.get("k")] = p.get("v");
+      return { ok: true, status: 200, text: async () => "OK" };
+    }
+    if (u.endsWith("/api/layout")) {
+      state.layout = new URLSearchParams(opts.body).get("v");
       return { ok: true, status: 200, text: async () => "OK" };
     }
     if (u.endsWith("/api/exit")) return { ok: true, status: 200, text: async () => "OK" };
@@ -120,13 +135,16 @@ async function loadUI({ forceAP, state }) {
 // state registry so the iframe can reach the same objects
 const states = {};
 const frameErrors = [];
-window.__frameError = (m) => { frameErrors.push(m); log(`  [page error] ${m}`, "fail"); };
+// An unhandled error in the page must fail the run, not just colour a line red
+window.__frameError = (m) => { frameErrors.push(m); failed++; log(`  [page error] ${m}`, "fail"); };
 window.__stateFor = (id) => states[id];
 window.__makeFakeSerial = makeFakeSerial;
 window.__makeFakeFetch = makeFakeFetch;
 
-function newState(id, useSerial) {
-  const s = { id, useSerial, mode: "NORMAL", keys: { 1: "KEY1", 2: "KEY2", 3: "{ZENHAN}" }, sent: [], raw: "", httpCalls: [] };
+function newState(id, useSerial, extra) {
+  const s = Object.assign(
+    { id, useSerial, mode: "NORMAL", layout: "jis", keys: { 1: "KEY1", 2: "KEY2", 3: "{ZENHAN}" }, sent: [], raw: "", httpCalls: [] },
+    extra || {});
   states[id] = s;
   return s;
 }
@@ -163,9 +181,50 @@ async function testSerialMode() {
   check("記号を含むマクロが欠けずに送られる",
         st.sent.some(l => l === "2={WIN+R}{WAIT:400}notepad{ENTER}"), JSON.stringify(st.sent));
 
+  d.getElementById("layout").value = "us";
+  d.getElementById("saveBtn").click();
+  await sleep(2000);
+  check("ホスト配列(JIS/US)を保存できる", st.layout === "us", `layout=${st.layout}`);
+
+  d.getElementById("k1").value = "";
+  d.getElementById("saveBtn").click();
+  await sleep(2000);
+  check("空欄で保存するとキーを無効化できる", st.keys[1] === "", `key1=${JSON.stringify(st.keys[1])}`);
+
   d.getElementById("exitBtn").click();
-  await sleep(700);
+  await sleep(900);
   check("終了で通常モードに戻る", st.sent.includes("exit") && st.mode === "NORMAL");
+}
+
+async function testDeviceControlledTextIsNotHtml() {
+  log("\nセキュリティ: デバイスが返す文字列をHTMLとして解釈しない", "name");
+  const st = newState("xss", true);
+  st.keys[1] = '<img src=x onerror="parent.__xss=1">';
+  const w = await loadUI({ forceAP: undefined, state: st });
+  const d = w.document;
+  w.__xss = undefined; window.__xss = undefined;
+  d.getElementById("connectBtn").click();
+  await sleep(800);
+  d.getElementById("loadBtn").click();
+  await sleep(1200);
+  check("マクロに含まれるHTMLが実行されない", !window.__xss && !w.__xss);
+  check("ログにDOM要素として注入されない", d.getElementById("log").querySelector("img") === null);
+  check("マクロ文字列はそのままフォームに入る",
+        d.getElementById("k1").value === '<img src=x onerror="parent.__xss=1">', d.getElementById("k1").value);
+}
+
+async function testSlowDevice() {
+  log("\n遅いデバイス(WiFi起動などで応答が遅れる場合)", "name");
+  const st = newState("slow", true, { slowMs: 1200 });   // slower than any fixed sleep
+  const w = await loadUI({ forceAP: undefined, state: st });
+  const d = w.document;
+  d.getElementById("connectBtn").click();
+  await sleep(800);
+  d.getElementById("loadBtn").click();
+  await sleep(3000);
+  check("応答が遅くても全キーを取りこぼさない",
+        d.getElementById("k1").value === "KEY1" && d.getElementById("k2").value === "KEY2" && d.getElementById("k3").value === "{ZENHAN}",
+        `k1=${d.getElementById("k1").value} k2=${d.getElementById("k2").value} k3=${d.getElementById("k3").value}`);
 }
 
 async function testApMode() {
@@ -182,9 +241,11 @@ async function testApMode() {
         d.getElementById("k3").value === "{ZENHAN}", `k3=${d.getElementById("k3").value}`);
 
   d.getElementById("k1").value = "hello{ENTER}";
+  d.getElementById("layout").value = "us";
   d.getElementById("saveBtn").click();
-  await sleep(900);
+  await sleep(1200);
   check("保存で /api/set が呼ばれ値が反映される", st.keys[1] === "hello{ENTER}", `key1=${st.keys[1]}`);
+  check("保存で /api/layout も呼ばれる", st.layout === "us", `layout=${st.layout}`);
 
   d.getElementById("exitBtn").click();
   await sleep(400);
@@ -206,6 +267,8 @@ async function testErrorHandling() {
   try {
     await testSerialMode();
     await testApMode();
+    await testDeviceControlledTextIsNotHtml();
+    await testSlowDevice();
     await testErrorHandling();
   } catch (e) {
     failed++;

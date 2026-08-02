@@ -37,9 +37,19 @@
 <div id="keys"></div>
 
 <div class="card">
+  <h2>ホストのキーボード配列</h2>
+  <select id="layout">
+    <option value="jis">JIS(日本語配列)</option>
+    <option value="us">US(英語配列)</option>
+  </select>
+  <div class="hint">記号(<code>: @ ( ) _ \</code> など)を正しく打つために、接続先PCの配列に合わせます。</div>
+</div>
+
+<div class="card">
   <button id="loadBtn">読み込み</button>
   <button id="saveBtn">保存</button>
   <button id="exitBtn" class="secondary">configモード終了</button>
+  <div class="hint">テキスト欄を空にして保存すると、そのキーは無効になります。</div>
 </div>
 
 <div class="card">
@@ -78,7 +88,17 @@ const NKEYS = 3;
 // window.__forceAP lets the e2e harness exercise both paths.
 const isAP = (typeof window.__forceAP === "boolean") ? window.__forceAP : location.hostname === "192.168.4.1";
 const $ = (id) => document.getElementById(id);
-const log = (m, cls) => { const el = $("log"); el.innerHTML += (cls ? `<span class="${cls}">${m}</span>` : m) + "\n"; el.scrollTop = el.scrollHeight; };
+// textContent, never innerHTML: this logs device-controlled text (macros are
+// echoed back), so innerHTML here would be a script-injection hole.
+const log = (m, cls) => {
+  const el = $("log");
+  const span = document.createElement("span");
+  if (cls) span.className = cls;
+  span.textContent = m + "\n";
+  el.appendChild(span);
+  while (el.childNodes.length > 300) el.removeChild(el.firstChild);
+  el.scrollTop = el.scrollHeight;
+};
 
 // build key editors
 const keysDiv = $("keys");
@@ -101,18 +121,46 @@ if (isAP) { $("serialCard").style.display = "none"; $("apCard").style.display = 
 let port = null, writer = null, rxBuf = "";
 async function serialConnect() {
   if (!navigator.serial) { log("このブラウザはWeb Serial非対応です(Chrome/Edgeを使用してください)", "stat-err"); return; }
+  if (writer) { log("すでに接続済みです", "stat-err"); return; }
   port = await navigator.serial.requestPort();
   await port.open({ baudRate: 115200 });
   writer = port.writable.getWriter();
   (async () => {
-    const dec = new TextDecoder();
+    const dec = new TextDecoder(undefined, { fatal: false });
     const reader = port.readable.getReader();
-    try { while (true) { const { value, done } = await reader.read(); if (done) break; rxBuf += dec.decode(value); log(dec.decode(value).trimEnd()); } } catch (e) {}
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        const text = dec.decode(value, { stream: true });  // keep multi-byte chars intact
+        rxBuf += text;
+        if (rxBuf.length > 20000) rxBuf = rxBuf.slice(-8000);
+        log(text.replace(/\s+$/, ""));
+      }
+    } catch (e) {
+      log("シリアル接続が切れました: " + e.message, "stat-err");
+    }
+    writer = null;
+    $("stat").textContent = "切断"; $("stat").className = "stat-err";
   })();
   $("stat").textContent = "接続済み"; $("stat").className = "stat-ok";
-  await sendLine("config");
+  await sendLine("config", /CONFIG MODE/);
 }
-async function sendLine(s) { rxBuf = ""; await writer.write(new TextEncoder().encode(s + "\n")); await new Promise(r => setTimeout(r, 400)); }
+
+// Waits for the device's reply instead of sleeping a fixed time: the firmware
+// can stall for hundreds of ms (WiFi AP startup), which used to truncate reads.
+async function sendLine(s, expect, timeoutMs = 4000) {
+  if (!writer) throw new Error("未接続です");
+  rxBuf = "";
+  await writer.write(new TextEncoder().encode(s + "\n"));
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 50));
+    if (!expect || expect.test(rxBuf)) return rxBuf;
+  }
+  if (expect) log(`応答待ちタイムアウト: ${s}`, "stat-err");
+  return rxBuf;
+}
 
 // ---- shared ops ----
 async function doLoad() {
@@ -121,34 +169,47 @@ async function doLoad() {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const j = await res.json();
     for (let i = 1; i <= NKEYS; i++) $(`k${i}`).value = j[i] || "";
+    if (j.layout) $("layout").value = j.layout;
     log("読み込み完了", "stat-ok");
   } else {
     if (!writer) { log("先にシリアル接続してください", "stat-err"); return; }
-    await sendLine("show");
-    for (const line of rxBuf.split("\n")) {
+    // "layout = ..." is the last line the device prints for `show`
+    const rx = await sendLine("show", /layout = (jis|us)/);
+    let got = 0;
+    for (const line of rx.split("\n")) {
       const m = line.match(/^key([1-3]) = (.*)$/);
-      if (m) $(`k${m[1]}`).value = m[2].replace(/\r$/, "");
+      if (m) { $(`k${m[1]}`).value = m[2].replace(/\r$/, ""); got++; }
+      const l = line.match(/^layout = (jis|us)/);
+      if (l) $("layout").value = l[1];
     }
+    if (got < NKEYS) { log(`読み込み失敗: ${got}/${NKEYS} 件しか取得できませんでした`, "stat-err"); return; }
     log("読み込み完了", "stat-ok");
   }
 }
 async function doSave() {
+  if (!isAP && !writer) { log("先にシリアル接続してください", "stat-err"); return; }
   for (let i = 1; i <= NKEYS; i++) {
-    const v = $(`k${i}`).value.replace(/[\r\n]/g, "");
-    if (!v) continue;
+    const v = $(`k${i}`).value.replace(/[\r\n]/g, "");   // empty value clears the key
     if (isAP) {
       const r = await fetch("/api/set", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: `k=${i}&v=${encodeURIComponent(v)}` });
-      log(`キー${i}: ${(await r.text()).trim()}`);
+      log(`キー${i}: ${(await r.text()).trim()}`, r.ok ? null : "stat-err");
     } else {
-      if (!writer) { log("先にシリアル接続してください", "stat-err"); return; }
-      await sendLine(`${i}=${v}`);
+      await sendLine(`${i}=${v}`, /(OK:|ERR)/);
     }
   }
-  log("保存処理完了(上のログでOK:を確認)", "stat-ok");
+  const lay = $("layout").value;
+  if (isAP) {
+    const r = await fetch("/api/layout", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: `v=${lay}` });
+    log(`レイアウト: ${(await r.text()).trim()}`, r.ok ? null : "stat-err");
+  } else {
+    await sendLine(`layout=${lay}`, /(OK:|ERR)/);
+  }
+  log("保存完了(上のログでOK:を確認)", "stat-ok");
 }
 async function doExit() {
   if (isAP) { await fetch("/api/exit", { method: "POST" }); log("configモードを終了しました(WiFi APは停止)", "stat-ok"); }
-  else if (writer) { await sendLine("exit"); }
+  else if (writer) { await sendLine("exit", /NORMAL MODE/); }
+  else log("先にシリアル接続してください", "stat-err");
 }
 
 $("connectBtn").onclick = () => serialConnect().catch(e => log("接続エラー: " + e.message, "stat-err"));

@@ -26,7 +26,18 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include "esp32-hal-tinyusb.h"
-#include "webui_html.h"  // CONFIG_HTML[] generated from webui/index.html
+// CONFIG_HTML[] is generated from webui/index.html by build.ps1. Without it the
+// sketch still builds (Wokwi, a bare Arduino IDE copy) and serves a pointer to
+// the hosted copy instead of the embedded page.
+#if __has_include("webui_html.h")
+#include "webui_html.h"
+#else
+const char CONFIG_HTML[] PROGMEM =
+    "<!doctype html><meta charset=utf-8><title>MacroPad</title>"
+    "<p>This build has no embedded UI. Open "
+    "<a href=\"https://noxitro.github.io/esp32s3/webui/\">the hosted config page</a>"
+    " and connect over USB (WebSerial).";
+#endif
 
 #if ARDUINO_USB_MODE == 0
 #include "USB.h"
@@ -76,8 +87,10 @@ unsigned long comboStartMs = 0;
 bool comboActive = false;
 
 String serialLine;
+bool serialOverflow = false;  // drop the rest of an over-long line, not its head
 unsigned long lastBlinkMs = 0;
 bool blinkOn = false;
+bool pageArmed = false;       // a lone key is down and may open the config page
 
 // ---------------- NVS ----------------
 
@@ -97,12 +110,16 @@ void saveLayout(bool jis) {
   layoutJIS = jis;
 }
 
-void saveString(int idx, const String &value) {
+// Returns false if the value could not be persisted (NVS full/corrupt), so the
+// caller never reports success for a setting that will vanish on reboot.
+bool saveString(int idx, const String &value) {
   const char *keys[NUM_KEYS] = {"s1", "s2", "s3"};
   prefs.begin("keycfg", false);
-  prefs.putString(keys[idx], value);
+  size_t written = prefs.putString(keys[idx], value);
   prefs.end();
+  if (written != value.length()) return false;
   keyStrings[idx] = value;
+  return true;
 }
 
 // ---------------- macro engine ----------------
@@ -182,7 +199,11 @@ bool execToken(String tok) {
       uint8_t raw = 0;
       for (auto &k : RAW_KEYS) if (part == k.name) { raw = k.code; break; }
       if (raw) { Keyboard.pressRaw(raw); }
-      else if (part.length() == 1) { Keyboard.press(part[0] | 0x20); }  // letters lowercase
+      // A-Z only: "| 0x20" would turn @ [ \ ] ^ _ into a different character
+      else if (part.length() == 1) {
+        char pc = part[0];
+        Keyboard.press((pc >= 'A' && pc <= 'Z') ? (pc | 0x20) : pc);
+      }
       else {
         uint8_t m = modifierCode(part);   // combo ending in a modifier, e.g. {WIN}
         if (!m) { Keyboard.releaseAll(); return false; }
@@ -230,7 +251,7 @@ void execMacro(const String &m) {
     char c = m[i];
     if (c == '{') {
       int close = m.indexOf('}', i);
-      if (close < 0) break;
+      if (close < 0) { typeChar(c); delay(8); continue; }  // unmatched: literal '{'
       String tok = m.substring(i + 1, close);
       if (!execToken(tok)) Serial.printf("MACRO ERR: unknown token {%s}\n", tok.c_str());
       i = close;
@@ -244,6 +265,7 @@ void execMacro(const String &m) {
 }
 
 void sendKey(int idx) {
+  if (keyStrings[idx].length() == 0) return;   // cleared key: do nothing
   execMacro(keyStrings[idx]);
   Serial.printf("SENT[%d]: %s\n", idx + 1, keyStrings[idx].c_str());
 }
@@ -285,22 +307,43 @@ String jsonEscape(const String &s) {
 void handleKeys() {
   String j = "{";
   for (int i = 0; i < NUM_KEYS; i++) {
-    j += "\"" + String(i + 1) + "\":\"" + jsonEscape(keyStrings[i]) + "\"";
-    if (i < NUM_KEYS - 1) j += ",";
+    j += "\"" + String(i + 1) + "\":\"" + jsonEscape(keyStrings[i]) + "\",";
   }
-  j += "}";
+  j += "\"layout\":\"" + String(layoutJIS ? "jis" : "us") + "\"}";
   server.send(200, "application/json; charset=utf-8", j);
 }
 
+// Only same-device pages may drive the API: a page on the phone that happens to
+// be open while it is joined to the AP must not be able to POST here.
+bool originAllowed() {
+  String o = server.header("Origin");
+  if (o.length() == 0) return true;  // same-origin form posts send no Origin
+  return o.indexOf(WiFi.softAPIP().toString()) >= 0;
+}
+
 void handleSet() {
+  if (!originAllowed()) { server.send(403, "text/plain", "ERR: bad origin"); return; }
   int k = server.arg("k").toInt();
-  String v = server.arg("v");
-  if (k < 1 || k > NUM_KEYS || v.length() == 0 || v.length() > MACRO_MAX_LEN) {
+  String v = server.arg("v");           // empty value clears the macro
+  if (k < 1 || k > NUM_KEYS || v.length() > MACRO_MAX_LEN) {
     server.send(400, "text/plain", "ERR: bad k or v");
     return;
   }
-  saveString(k - 1, v);
+  if (!saveString(k - 1, v)) {
+    Serial.printf("ERR: key%d not saved (NVS)\n", k);
+    server.send(500, "text/plain", "ERR: not saved");
+    return;
+  }
   Serial.printf("OK: key%d = %s (via web)\n", k, v.c_str());
+  server.send(200, "text/plain", "OK");
+}
+
+void handleLayout() {
+  if (!originAllowed()) { server.send(403, "text/plain", "ERR: bad origin"); return; }
+  String v = server.arg("v");
+  if (v != "jis" && v != "us") { server.send(400, "text/plain", "ERR: bad layout"); return; }
+  saveLayout(v == "jis");
+  Serial.printf("OK: layout = %s (via web)\n", v.c_str());
   server.send(200, "text/plain", "OK");
 }
 
@@ -310,10 +353,14 @@ void startConfigServer() {
   server.on("/", []() { server.send_P(200, "text/html; charset=utf-8", CONFIG_HTML); });
   server.on("/api/keys", HTTP_GET, handleKeys);
   server.on("/api/set", HTTP_POST, handleSet);
+  server.on("/api/layout", HTTP_POST, handleLayout);
   server.on("/api/exit", HTTP_POST, []() {
+    if (!originAllowed()) { server.send(403, "text/plain", "ERR: bad origin"); return; }
     server.send(200, "text/plain", "OK");
     exitRequested = true;
   });
+  const char *headers[] = {"Origin"};
+  server.collectHeaders(headers, 1);
   server.begin();
   Serial.printf("WiFi AP: %s (pass: %s)  http://%s/\n",
                 AP_SSID, AP_PASS, WiFi.softAPIP().toString().c_str());
@@ -385,12 +432,15 @@ void handleConfigCommand(String line) {
   }
   if (line.length() >= 2 && line[0] >= '1' && line[0] <= '3' && line[1] == '=') {
     int idx = line[0] - '1';
-    String value = line.substring(2);
-    if (value.length() == 0 || value.length() > MACRO_MAX_LEN) {
-      Serial.println("ERR: empty or too long");
+    String value = line.substring(2);   // "n=" with no value clears the macro
+    if (value.length() > MACRO_MAX_LEN) {
+      Serial.println("ERR: too long");
       return;
     }
-    saveString(idx, value);
+    if (!saveString(idx, value)) {
+      Serial.printf("ERR: key%d not saved (NVS)\n", idx + 1);
+      return;
+    }
     Serial.printf("OK: key%d = %s\n", idx + 1, value.c_str());
     return;
   }
@@ -410,22 +460,27 @@ void pollSerial() {
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
     if (c == '\n') {
-      if (mode == CONFIG) handleConfigCommand(serialLine);
+      if (serialOverflow) { Serial.println("ERR: line too long"); }
+      else if (mode == CONFIG) handleConfigCommand(serialLine);
       else handleNormalCommand(serialLine);
       serialLine = "";
-    } else if (c != '\r') {
+      serialOverflow = false;
+    } else if (c != '\r' && !serialOverflow) {
       serialLine += c;
-      if (serialLine.length() > MACRO_MAX_LEN + 8) serialLine = "";
+      // discard the whole line, not just its head: a truncated tail could
+      // otherwise be executed as its own command
+      if (serialLine.length() > MACRO_MAX_LEN + 8) { serialLine = ""; serialOverflow = true; }
     }
   }
 }
 
 // ---------------- buttons ----------------
 
-void pollButtons(bool pressEdge[NUM_KEYS]) {
+void pollButtons(bool pressEdge[NUM_KEYS], bool releaseEdge[NUM_KEYS]) {
   unsigned long now = millis();
   for (int i = 0; i < NUM_KEYS; i++) {
     pressEdge[i] = false;
+    releaseEdge[i] = false;
     bool reading = digitalRead(BUTTON_PINS[i]) == LOW;
     if (reading != lastReading[i]) {
       lastChangeMs[i] = now;
@@ -434,8 +489,15 @@ void pollButtons(bool pressEdge[NUM_KEYS]) {
     if ((now - lastChangeMs[i]) >= DEBOUNCE_MS && reading != stableState[i]) {
       stableState[i] = reading;
       if (reading) pressEdge[i] = true;
+      else releaseEdge[i] = true;
     }
   }
+}
+
+int keysDown() {
+  int n = 0;
+  for (int i = 0; i < NUM_KEYS; i++) if (stableState[i]) n++;
+  return n;
 }
 
 bool pollCombo() {
@@ -506,11 +568,12 @@ void setup() {
 }
 
 void loop() {
-  bool pressEdge[NUM_KEYS];
-  pollButtons(pressEdge);
+  bool pressEdge[NUM_KEYS], releaseEdge[NUM_KEYS];
+  pollButtons(pressEdge, releaseEdge);
   pollSerial();
 
   if (pollCombo()) {
+    pageArmed = false;  // the 3-key hold is a mode toggle, not a page request
     if (mode == NORMAL) enterConfigMode();
     else exitConfigMode();
     return;
@@ -524,9 +587,15 @@ void loop() {
   } else {
     server.handleClient();
     if (exitRequested) { exitConfigMode(); return; }
-    // any key in config mode opens the web config page on the host (Windows)
+    // A single tap opens the web config page on the host. It fires on release
+    // and only for a lone key, so the 3-key hold used to LEAVE config mode
+    // never types Win+R into whatever the host has focused.
     for (int i = 0; i < NUM_KEYS; i++) {
-      if (pressEdge[i]) { openConfigPage(); break; }
+      if (pressEdge[i]) pageArmed = (keysDown() == 1);
+      if (releaseEdge[i] && pageArmed && keysDown() == 0) {
+        pageArmed = false;
+        openConfigPage();
+      }
     }
     unsigned long now = millis();
     if (now - lastBlinkMs >= CONFIG_BLINK_MS) {

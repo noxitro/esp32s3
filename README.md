@@ -115,7 +115,7 @@ arduino-cliの場合:
 ./build.ps1 -Hid
 ```
 
-その後 `arduino-cli upload -p <COMポート> --fqbn esp32:esp32:esp32s3:USBMode=default build/sketch` で書き込み。
+その後 `arduino-cli upload -p <COMポート> --fqbn esp32:esp32:XIAO_ESP32S3:USBMode=default build/sketch` で書き込み。
 
 Androidでは USB-C ケーブルで直結(OTG対応端末)。メモ帳アプリ等を開いてキーを押すと文字列が入力されます。
 
