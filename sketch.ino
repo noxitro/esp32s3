@@ -25,8 +25,7 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include <soc/rtc_cntl_reg.h>
-#include <esp_rom_sys.h>
+#include "esp32-hal-tinyusb.h"
 #include "webui_html.h"  // CONFIG_HTML[] generated from webui/index.html
 
 #if ARDUINO_USB_MODE == 0
@@ -249,6 +248,21 @@ void sendKey(int idx) {
   Serial.printf("SENT[%d]: %s\n", idx + 1, keyStrings[idx].c_str());
 }
 
+// Reboots into the ROM download mode so the firmware can be reflashed.
+// Must use the core's usb_persist_restart(): besides setting the RTC download
+// flag it switches the USB PHY from OTG to CDC/JTAG, without which the ROM
+// never enumerates. It is NOT gated by Serial.enableReboot(false).
+void rebootToBootloader() {
+#if HAS_USB_HID
+  Serial.println("Rebooting into download mode...");
+  Serial.flush();
+  delay(200);
+  usb_persist_restart(RESTART_BOOTLOADER);
+#else
+  Serial.println("ERR: download mode requires the USB-OTG build");
+#endif
+}
+
 // Types a Win+R macro on the host so it opens the hosted config UI in a browser
 void openConfigPage() {
   Serial.printf("Opening config page on host: %s\n", CONFIG_URL);
@@ -357,14 +371,7 @@ void handleConfigCommand(String line) {
     Serial.printf("Already in config mode. http://%s/\n", WiFi.softAPIP().toString().c_str());
     return;
   }
-  if (line == "boot") {   // reboot into the ROM download mode for flashing
-    Serial.println("Rebooting into download mode...");
-    Serial.flush();
-    delay(200);
-    REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
-    esp_rom_software_reset_system();  // keeps the RTC flag; esp_restart() clears it
-    return;
-  }
+  if (line == "boot") { rebootToBootloader(); return; }
   if (line == "layout=jis" || line == "layout=us") {
     saveLayout(line.endsWith("jis"));
     Serial.printf("OK: layout = %s\n", layoutJIS ? "jis" : "us");
@@ -395,6 +402,8 @@ void handleNormalCommand(String line) {
   line.trim();
   if (line == "config") enterConfigMode();
   else if (line == "show") printStrings();
+  else if (line == "boot") rebootToBootloader();
+  else if (line.length()) Serial.printf("ERR: unknown command: %s (try 'config')\n", line.c_str());
 }
 
 void pollSerial() {
@@ -465,6 +474,19 @@ void setup() {
   }
 
   loadStrings();
+
+#if HAS_USB_HID
+  // Escape hatch: holding all three keys while powering up enters the ROM
+  // download mode, so the board can always be reflashed without the tiny BOOT
+  // button and without a working serial link.
+  delay(50);
+  if (digitalRead(BUTTON_PINS[0]) == LOW && digitalRead(BUTTON_PINS[1]) == LOW &&
+      digitalRead(BUTTON_PINS[2]) == LOW) {
+    setAllLeds(true);
+    delay(300);
+    usb_persist_restart(RESTART_BOOTLOADER);
+  }
+#endif
 
 #if HAS_USB_HID
   // Opening/closing the CDC port (Arduino IDE, WebSerial, esptool) otherwise
