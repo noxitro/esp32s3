@@ -247,6 +247,12 @@ void sendKey(int idx) {
   Serial.printf("SENT[%d]: %s\n", idx + 1, keyStrings[idx].c_str());
 }
 
+// Types a Win+R macro on the host so it opens the hosted config UI in a browser
+void openConfigPage() {
+  Serial.printf("Opening config page on host: %s\n", CONFIG_URL);
+  execMacro(String("{WIN+R}{WAIT:600}") + CONFIG_URL + "{WAIT:200}{ENTER}");
+}
+
 // ---------------- config web server (WiFi AP) ----------------
 
 String jsonEscape(const String &s) {
@@ -323,8 +329,8 @@ void enterConfigMode() {
   lastBlinkMs = millis();
   setAllLeds(false);
   Serial.println("CONFIG MODE");
-  Serial.println("Commands: 1=<macro>  2=<macro>  3=<macro>  show  test1|test2|test3  exit");
-  Serial.printf("Press key 1 to open the config page: %s\n", CONFIG_URL);
+  Serial.println("Commands: 1=<macro>  2=<macro>  3=<macro>  show  test1|test2|test3  open  layout=jis|us  exit");
+  Serial.printf("Press any key (or send 'open') to open the config page: %s\n", CONFIG_URL);
   startConfigServer();
 }
 
@@ -343,6 +349,7 @@ void handleConfigCommand(String line) {
 
   if (line == "exit") { exitConfigMode(); return; }
   if (line == "show") { printStrings(); return; }
+  if (line == "open") { openConfigPage(); return; }
   if (line == "layout=jis" || line == "layout=us") {
     saveLayout(line.endsWith("jis"));
     Serial.printf("OK: layout = %s\n", layoutJIS ? "jis" : "us");
@@ -476,10 +483,9 @@ void loop() {
   } else {
     server.handleClient();
     if (exitRequested) { exitConfigMode(); return; }
-    // key 1 in config mode: open the web config page on the host (Windows)
-    if (pressEdge[0]) {
-      Serial.println("Opening config page on host...");
-      execMacro(String("{WIN+R}{WAIT:400}") + CONFIG_URL + "{ENTER}");
+    // any key in config mode opens the web config page on the host (Windows)
+    for (int i = 0; i < NUM_KEYS; i++) {
+      if (pressEdge[i]) { openConfigPage(); break; }
     }
     unsigned long now = millis();
     if (now - lastBlinkMs >= CONFIG_BLINK_MS) {
